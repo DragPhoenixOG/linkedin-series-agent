@@ -1,0 +1,122 @@
+name: Post to LinkedIn
+
+# Runs every day at 03:30 UTC (9:00 AM IST). The agent itself decides whether today is a posting
+# day (every `post_interval_days`, default 3), so a cron like */3 isn't needed.
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: write and check a post, but don't publish or commit"
+        type: boolean
+        default: false
+      force:
+        description: "Ignore the posting interval"
+        type: boolean
+        default: false
+      topic_id:
+        description: "Write about this topic id from content/topics.yaml (optional)"
+        type: string
+        required: false
+      post_type:
+        description: "Force the post type (dry runs: preview each kind)"
+        type: choice
+        options: [auto, skill, news]
+        default: auto
+      tone:
+        description: "Force the tone"
+        type: choice
+        options: [auto, straight, humorous]
+        default: auto
+      format:
+        description: "Force the format (dry runs: by default every run on one day picks the same one)"
+        type: choice
+        options: [auto, observation, contrarian, explainer, mistake, question, story, news_reaction, dry_take]
+        default: auto
+      writer_model:
+        description: "Try another writer model for this run, e.g. moonshotai.kimi-k2.5 (optional)"
+        type: string
+        required: false
+      check:
+        description: "Only check the API key, model names and research feeds"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: linkedin-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # No pip cache: the dependencies install from PyPI in seconds, while GitHub's cache
+      # service sometimes throttles downloads until the job times out.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -e .
+
+      - name: Run agent
+        id: agent
+        env:
+          # Only the key for `llm_provider` in config.yaml is needed; the others can stay unset.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+          LINKEDIN_PERSON_URN: ${{ secrets.LINKEDIN_PERSON_URN }}
+          LINKEDIN_TOKEN_EXPIRES_ON: ${{ vars.LINKEDIN_TOKEN_EXPIRES_ON }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Inputs go through env vars, never straight into the script, so they can't inject shell.
+          DRY_RUN: ${{ inputs.dry_run }}
+          FORCE: ${{ inputs.force }}
+          TOPIC_ID: ${{ inputs.topic_id }}
+          POST_TYPE: ${{ inputs.post_type }}
+          TONE: ${{ inputs.tone }}
+          FORMAT: ${{ inputs.format }}
+          WRITER_MODEL: ${{ inputs.writer_model }}
+          CHECK: ${{ inputs.check }}
+        run: |
+          args=()
+          if [ -n "$WRITER_MODEL" ]; then args+=(--writer-model "$WRITER_MODEL"); fi
+          if [ "$CHECK" = "true" ]; then python -m agent.main --check "${args[@]}"; exit $?; fi
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          if [ "$FORCE" = "true" ]; then args+=(--force); fi
+          if [ -n "$TOPIC_ID" ]; then args+=(--topic-id "$TOPIC_ID"); fi
+          if [ -n "$POST_TYPE" ] && [ "$POST_TYPE" != "auto" ]; then args+=(--post-type "$POST_TYPE"); fi
+          if [ -n "$TONE" ] && [ "$TONE" != "auto" ]; then args+=(--tone "$TONE"); fi
+          if [ -n "$FORMAT" ] && [ "$FORMAT" != "auto" ]; then args+=(--format "$FORMAT"); fi
+          python -m agent.main "${args[@]}"
+
+      # Runs even if the agent failed, so a published post is always recorded.
+      - name: Commit state
+        if: always() && inputs.dry_run != true && inputs.check != true
+        env:
+          COMMIT_MESSAGE: ${{ steps.agent.outputs.commit_message }}
+        run: |
+          git add state content/topics.yaml posts
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "${COMMIT_MESSAGE:-chore: update agent state}"
+          for attempt in 1 2 3; do
+            git pull --rebase origin "$GITHUB_REF_NAME" && git push origin "HEAD:$GITHUB_REF_NAME" && exit 0
+            sleep $((attempt * 10))
+          done
+          echo "::error::Could not push state. Commit it by hand or the next run may repost."
+          exit 1

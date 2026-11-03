@@ -1,0 +1,78 @@
+# Runtime configuration for the LinkedIn AI series agent.
+# Secrets never go here: see .env.example and the README.
+
+# --- Schedule -------------------------------------------------------------
+post_interval_days: 3
+post_time_utc: "03:30"            # the workflow cron runs daily at this time (9:00 AM IST)
+
+# --- Language model ---------------------------------------------------------
+# Which provider writes and edits the posts (README, "Model provider", has the full list):
+#   bedrock-openai: open models on Amazon Bedrock through its OpenAI-compatible endpoint, key in
+#                   AWS_BEARER_TOKEN_BEDROCK (set llm_base_url and llm_api_key_env as below)
+#   anthropic:      Claude direct, key in ANTHROPIC_API_KEY (prepaid credit at platform.claude.com)
+#   bedrock:        Claude on Amazon Bedrock, key in AWS_BEARER_TOKEN_BEDROCK
+#   gemini / groq:  free tiers, keys in GEMINI_API_KEY / GROQ_API_KEY
+# Run the workflow with "check" to list the models your key can use. Use a different model as
+# editor than as writer. A model that is missing or keeps failing switches to fallback_model.
+llm_provider: bedrock-openai
+writer_model: moonshotai.kimi-k2.5  # passed 6 of 8 dry runs on 2-3 Nov 2026; DeepSeek V3.2 passed 4 of 8
+editor_model: mistral.mistral-large-3-675b-instruct  # the most accurate reviewer so far
+research_model: deepseek.v3.2
+llm_base_url: https://bedrock-mantle.us-east-1.api.aws/v1
+llm_api_key_env: AWS_BEARER_TOKEN_BEDROCK
+max_output_tokens: 8192
+fallback_model: mistral.mistral-large-3-675b-instruct  # used for the rest of a run if a model keeps saying "overloaded"
+                                    # ("" to turn off)   groq: openai/gpt-oss-20b
+                                    # bedrock: anthropic.claude-sonnet-5, tried once if Claude
+                                    # declines a request (anthropic does this server-side)
+aws_region: us-east-1               # bedrock only: the AWS region your Bedrock API key belongs to
+llm_timeout_seconds: 90             # give up on a single request after this long, then retry
+writer_effort: high                 # anthropic only: output_config.effort
+editor_effort: high                 # anthropic only
+research_effort: medium             # anthropic only
+refusal_fallback: true              # anthropic and bedrock: retry a safety decline on another model
+
+# Prices in USD per 1M tokens, only for the cost estimate in the run summary. Free tiers: none.
+pricing:
+  claude-sonnet-5-5: {input: 2.00, output: 10.00, cache_write: 2.50, cache_read: 0.20}
+  anthropic.claude-sonnet-5-5: {input: 2.20, output: 11.00, cache_write: 2.75, cache_read: 0.22}
+
+# --- Research sources (free, no keys) ---------------------------------------
+# RSS feeds and Hacker News search, listed in content/feeds.yaml.
+research_lookback_days: 45          # how far back "recent" goes for skill-post research
+max_articles_to_read: 6             # articles fetched and given to the model per research step
+article_max_chars: 5000             # text kept per article; on the Groq free tier use ~2500
+fetch_timeout_seconds: 15
+
+# --- Post shape (section 4) ----------------------------------------------
+min_words: 120
+max_words: 250
+max_hashtags: 3
+max_emojis: 1
+max_em_dashes: 1
+max_bullets: 4
+max_links: 1
+
+# --- Quality gates --------------------------------------------------------
+min_editor_score: 8
+min_humour_score: 7
+max_attempts: 5                     # write -> edit -> lint rounds before giving up (brief: 3; raised to 5, Oct 2026)
+
+# --- Content mix (section 2a) ---------------------------------------------
+news_post_ratio: 0.33
+news_lookback_days: 7
+news_recent_window: 10              # "already covered in the last 10 posts"
+news_max_headlines: 60              # headlines the news scan reads; on the Groq free tier use ~25
+big_news_check: true                # on skill days, a major verified story may jump the queue
+humour_ratio: 0.33
+
+# --- Topic backlog ----------------------------------------------------------
+auto_extend_topics: true
+min_pending_topics: 3
+new_topics_per_extension: 5
+
+# --- Publishing -------------------------------------------------------------
+review_window_hours: 20             # each draft waits this long as an issue before posting; 0 posts at once
+linkedin_api_version: "202610"      # LinkedIn Marketing API version (Oct 2026); supported >= 1 year
+token_warning_days: 7               # open a reminder issue this many days before the token expires
+dry_run: false

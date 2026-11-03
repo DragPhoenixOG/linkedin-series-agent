@@ -1,0 +1,549 @@
+"""Language-model clients behind one small interface.
+
+- `OpenAICompatLLM` talks to any OpenAI-compatible chat endpoint. Gemini and Groq both offer one
+  (with free tiers), so switching between them is a config change.
+- `AnthropicLLM` uses the official Anthropic SDK for Claude (paid), either directly from Anthropic
+  or through Amazon Bedrock (the SDK's Bedrock Mantle client, same Messages API).
+
+Both return plain text, track token usage, and share forgiving JSON parsing.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import time
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+import anthropic
+import httpx
+
+from agent.config import Config
+from agent.logs import log_event
+from agent.templates import render
+
+logger = logging.getLogger(__name__)
+
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
+
+# provider -> (OpenAI-compatible base URL, env var holding the API key)
+PROVIDERS: dict[str, tuple[str, str]] = {
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"),
+    "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+    "anthropic": ("", "ANTHROPIC_API_KEY"),
+    "bedrock": ("", "AWS_BEARER_TOKEN_BEDROCK"),  # Claude on Amazon Bedrock, Bedrock API key
+}
+
+
+class LLMError(RuntimeError):
+    """The model call failed or returned something we can't use."""
+
+
+class LLMRefusal(LLMError):
+    """The model declined the request."""
+
+
+class LLMAuthError(LLMError):
+    """The provider rejected the API key or the API isn't enabled. Nothing will work until fixed,
+    so callers that otherwise carry on without a step (research, news) let this one through."""
+
+
+@dataclass
+class Usage:
+    """Token and cost totals for one run."""
+
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float = 0.0
+
+    def add(
+        self,
+        model: str,
+        pricing: dict[str, Any],
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_write: int = 0,
+        cache_read: int = 0,
+    ) -> dict[str, Any]:
+        """Add one call's usage; return that call's numbers for logging."""
+        rates = pricing.get(model, {})
+        cost = (
+            input_tokens * rates.get("input", 0)
+            + output_tokens * rates.get("output", 0)
+            + cache_write * rates.get("cache_write", 0)
+            + cache_read * rates.get("cache_read", 0)
+        ) / 1_000_000
+        self.calls += 1
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+        self.cache_write_tokens += cache_write
+        self.cache_read_tokens += cache_read
+        self.cost_usd += cost
+        return {"input": input_tokens, "output": output_tokens, "cost_usd": round(cost, 4)}
+
+    def summary(self) -> str:
+        return (
+            f"calls={self.calls} input={self.input_tokens} output={self.output_tokens} "
+            f"cache_read={self.cache_read_tokens} cache_write={self.cache_write_tokens} "
+            f"est_cost_usd={self.cost_usd:.3f}"
+        )
+
+
+@dataclass
+class LLMResponse:
+    """The model's final text."""
+
+    text: str
+    stop_reason: str = "end_turn"
+
+
+def extract_json(text: str, required: Sequence[str] = ()) -> Any:
+    """Parse JSON from model text: `<result>` tags first, then fenced blocks, then raw braces.
+
+    Raw line breaks inside strings are accepted (some models put them in long text fields). With
+    `required`, only an object holding all those keys counts, so a fragment of a broken reply
+    (one list item, say) is never mistaken for the whole answer.
+    """
+    candidates = re.findall(r"<result>\s*(.*?)\s*</result>", text, re.DOTALL)[::-1]
+    candidates += re.findall(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)[::-1]
+    candidates.append(text)
+    decoder = json.JSONDecoder(strict=False)
+
+    def acceptable(value: Any) -> bool:
+        return not required or (isinstance(value, dict) and all(k in value for k in required))
+
+    for candidate in candidates:
+        candidate = candidate.strip()
+        try:
+            value = decoder.decode(candidate)
+            if acceptable(value):
+                return value
+        except json.JSONDecodeError:
+            pass
+        for start in (m.start() for m in re.finditer(r"[{\[]", candidate)):
+            try:
+                value, _ = decoder.raw_decode(candidate[start:])
+            except json.JSONDecodeError:
+                continue
+            if acceptable(value):
+                return value
+    raise LLMError("Model response did not contain valid JSON")
+
+
+class LLM(ABC):
+    """What the agent needs from a model: text in, text out, usage tracked."""
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.usage = Usage()
+
+    @abstractmethod
+    def complete(
+        self,
+        *,
+        label: str,
+        model: str,
+        system: list[str],
+        prompt: str,
+        effort: str = "medium",
+        max_tokens: int = 16000,
+        json_schema: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        """Send one user prompt with system instructions and return the reply.
+
+        `system` is a list of text blocks; put stable, shared content (style guide, author facts)
+        first. With `json_schema`, the reply must be a JSON object matching it.
+        """
+
+    def complete_json(self, **kwargs: Any) -> tuple[Any, LLMResponse]:
+        """Like `complete`, then parse JSON. Asks once more if the first reply isn't valid JSON."""
+        schema = kwargs.get("json_schema") or {}
+        required = schema.get("required", []) if schema.get("type") == "object" else []
+        response = self.complete(**kwargs)
+        try:
+            return extract_json(response.text, required), response
+        except LLMError:
+            log_event(
+                logger,
+                "llm.bad_json",
+                logging.WARNING,
+                label=kwargs.get("label"),
+                start=response.text[:120].replace("\n", " "),
+            )
+        retry = dict(kwargs)
+        retry["label"] = f"{kwargs['label']}.retry"
+        retry["prompt"] = (
+            f"{kwargs['prompt']}\n\nYour previous reply was not valid JSON. "
+            "Reply again with only the JSON, nothing else."
+        )
+        response = self.complete(**retry)
+        return extract_json(response.text, required), response
+
+
+# Consecutive overload errors (5xx or timeouts) before switching to `fallback_model`.
+OVERLOAD_SWITCH = 2
+
+
+class OpenAICompatLLM(LLM):
+    """Any OpenAI-compatible `/chat/completions` endpoint (Gemini, Groq, ...).
+
+    Retries rate limits (429) and server errors with backoff, honouring `Retry-After`, because
+    free tiers hit per-minute limits quickly. When a model keeps answering "overloaded" (5xx or
+    timeouts), it switches to `config.fallback_model` and keeps using it for the rest of the run.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        base_url: str,
+        api_key: str,
+        http: httpx.Client | None = None,
+        max_retries: int = 5,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        super().__init__(config)
+        self.base_url = base_url.rstrip("/")
+        self._api_key = api_key
+        self._http = http or httpx.Client(timeout=float(config.llm_timeout_seconds))
+        self.max_retries = max_retries
+        self._sleep = sleep
+        self._overloaded: set[str] = set()  # models that kept failing this run
+        self._no_json_mode: set[str] = set()  # models whose endpoint rejected JSON mode
+        self._completion_tokens: set[str] = set()  # models that want `max_completion_tokens`
+
+    def _model_for(self, model: str) -> str:
+        fallback = self.config.fallback_model
+        return fallback if fallback and model in self._overloaded else model
+
+    def _post(self, label: str, body: dict[str, Any]) -> dict[str, Any]:
+        """POST with retries. May switch `body["model"]` to the fallback model when overloaded."""
+        headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
+        fallback = self.config.fallback_model
+        overloads = 0
+        attempt = 0
+        while True:
+            try:
+                response = self._http.post(
+                    f"{self.base_url}/chat/completions", json=body, headers=headers
+                )
+            except httpx.TransportError as exc:
+                error, delay = f"network error: {type(exc).__name__}", 2.0 ** (attempt + 1)
+                overloads += 1
+            else:
+                if response.status_code == 200:
+                    return response.json()
+                error = f"HTTP {response.status_code}: {_error_message(response)}"
+                if response.status_code == 401:
+                    raise LLMAuthError(f"{label}: the API key was rejected ({error})")
+                if response.status_code == 403:
+                    raise LLMAuthError(f"{label}: access denied for this API key ({error})")
+                if response.status_code == 404:
+                    if fallback and body["model"] != fallback:
+                        log_event(
+                            logger,
+                            "llm.model_not_found",
+                            logging.WARNING,
+                            label=label,
+                            model=body["model"],
+                            now_using=fallback,
+                            hint="run --check to see the models your key can use",
+                        )
+                        self._overloaded.add(body["model"])
+                        body["model"] = fallback
+                        overloads, attempt = 0, 0
+                        continue
+                    raise LLMError(
+                        f"{label}: {error}. Is the model name right? "
+                        "Run `python -m agent.main --check` to list available models."
+                    )
+                if response.status_code != 429 and response.status_code < 500:
+                    raise LLMError(f"{label}: request rejected ({error})")
+                overloads = overloads + 1 if response.status_code >= 500 else 0
+                retry_after = response.headers.get("retry-after", "")
+                delay = float(retry_after) if _is_number(retry_after) else 2.0 ** (attempt + 2)
+            if overloads >= OVERLOAD_SWITCH and fallback and body["model"] != fallback:
+                log_event(
+                    logger,
+                    "llm.fallback_model",
+                    logging.WARNING,
+                    label=label,
+                    overloaded=body["model"],
+                    now_using=fallback,
+                )
+                self._overloaded.add(body["model"])
+                body["model"] = fallback
+                overloads, attempt = 0, 0
+                continue
+            if attempt >= self.max_retries:
+                raise LLMError(f"{label}: still failing after retries ({error})")
+            log_event(logger, "llm.retry", logging.WARNING, label=label, error=error, wait_s=delay)
+            self._sleep(min(delay, 90.0))
+            attempt += 1
+
+    def _send(self, label: str, body: dict[str, Any]) -> dict[str, Any]:
+        """POST; resend with `max_completion_tokens` if the model rejects `max_tokens`.
+
+        Newer OpenAI models (GPT-5 and later) only accept `max_completion_tokens`.
+        """
+        if body["model"] in self._completion_tokens and "max_tokens" in body:
+            body["max_completion_tokens"] = body.pop("max_tokens")
+        try:
+            return self._post(label, body)
+        except LLMAuthError:
+            raise
+        except LLMError as exc:
+            if "max_completion_tokens" not in str(exc) or "max_tokens" not in body:
+                raise
+            log_event(logger, "llm.max_completion_tokens", model=body["model"])
+            self._completion_tokens.add(body["model"])
+            body["max_completion_tokens"] = body.pop("max_tokens")
+            return self._post(label, body)
+
+    def complete(
+        self,
+        *,
+        label: str,
+        model: str,
+        system: list[str],
+        prompt: str,
+        effort: str = "medium",
+        max_tokens: int = 16000,
+        json_schema: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        if json_schema is not None:
+            prompt = f"{prompt}\n\n{render('json_reply', schema=json.dumps(json_schema, indent=1))}"
+        body: dict[str, Any] = {
+            "model": self._model_for(model),
+            "messages": [
+                {"role": "system", "content": "\n\n".join(s for s in system if s)},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": min(max_tokens, self.config.max_output_tokens),
+        }
+        if json_schema is not None and body["model"] not in self._no_json_mode:
+            # JSON mode makes the server return valid JSON (no stray quotes or fences).
+            body["response_format"] = {"type": "json_object"}
+            try:
+                data = self._send(label, body)
+            except LLMAuthError:
+                raise
+            except LLMError as exc:
+                if "request rejected" not in str(exc):
+                    raise
+                log_event(logger, "llm.json_mode_unsupported", logging.WARNING, model=body["model"])
+                self._no_json_mode.add(body["model"])
+                del body["response_format"]
+                data = self._send(label, body)
+        else:
+            data = self._send(label, body)
+        model = body["model"]  # the fallback, if the requested model was overloaded
+        usage = data.get("usage") or {}
+        call = self.usage.add(
+            model,
+            self.config.pricing,
+            input_tokens=int(usage.get("prompt_tokens") or 0),
+            output_tokens=int(usage.get("completion_tokens") or 0),
+        )
+        choice = (data.get("choices") or [{}])[0]
+        finish = choice.get("finish_reason") or "stop"
+        log_event(logger, "llm.call", label=label, model=model, stop=finish, **call)
+        text = (choice.get("message") or {}).get("content") or ""
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        if finish == "length":
+            log_event(logger, "llm.truncated", logging.WARNING, label=label, max_tokens=max_tokens)
+        if finish == "content_filter":
+            raise LLMRefusal(f"{label}: the provider's safety filter blocked the reply")
+        if not text:
+            raise LLMError(f"{label}: empty response (finish_reason={finish})")
+        return LLMResponse(text=text, stop_reason=finish)
+
+    def list_models(self) -> list[str]:
+        """Model ids this key can use (for `--check`)."""
+        response = self._http.get(
+            f"{self.base_url}/models", headers={"Authorization": f"Bearer {self._api_key}"}
+        )
+        if response.status_code != 200:
+            error = f"HTTP {response.status_code}: {_error_message(response)}"
+            raise LLMError(f"Listing models failed ({error})")
+        return sorted(m["id"].removeprefix("models/") for m in response.json().get("data", []))
+
+
+class AnthropicLLM(LLM):
+    """Claude through the official Anthropic SDK.
+
+    On the Claude API a refused request is retried server-side (`fallbacks: "default"`). Bedrock
+    doesn't offer that, so there (`server_fallbacks=False`) a refusal is retried once on
+    `config.fallback_model` instead.
+    """
+
+    def __init__(self, client: Any, config: Config, *, server_fallbacks: bool = True) -> None:
+        super().__init__(config)
+        self.client = client
+        self._fallback_enabled = config.refusal_fallback and server_fallbacks
+        use_own_retry = config.refusal_fallback and not server_fallbacks
+        self._refusal_model = config.fallback_model if use_own_retry else ""
+
+    def _create(self, **kwargs: Any) -> Any:
+        if self._fallback_enabled:
+            try:
+                return self.client.beta.messages.create(
+                    betas=[FALLBACK_BETA], fallbacks="default", **kwargs
+                )
+            except anthropic.BadRequestError as exc:
+                if "fallback" not in str(exc).lower():
+                    raise
+                log_event(logger, "llm.fallback_unavailable", logging.WARNING, error=str(exc)[:200])
+                self._fallback_enabled = False
+        return self.client.messages.create(**kwargs)
+
+    def complete(
+        self,
+        *,
+        label: str,
+        model: str,
+        system: list[str],
+        prompt: str,
+        effort: str = "medium",
+        max_tokens: int = 16000,
+        json_schema: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        system_blocks: list[dict[str, Any]] = [{"type": "text", "text": s} for s in system if s]
+        if system_blocks:
+            system_blocks[0]["cache_control"] = {"type": "ephemeral"}
+        output_config: dict[str, Any] = {"effort": effort}
+        if json_schema is not None:
+            output_config["format"] = {"type": "json_schema", "schema": json_schema}
+        try:
+            response = self._create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system_blocks,
+                output_config=output_config,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+            raise LLMAuthError(f"{label}: the API key was rejected: {exc}") from exc
+        except anthropic.APIError as exc:
+            raise LLMError(f"{label}: API call failed: {exc}") from exc
+        usage = response.usage
+        call = self.usage.add(
+            model,
+            self.config.pricing,
+            input_tokens=getattr(usage, "input_tokens", 0) or 0,
+            output_tokens=getattr(usage, "output_tokens", 0) or 0,
+            cache_write=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            cache_read=getattr(usage, "cache_read_input_tokens", 0) or 0,
+        )
+        log_event(logger, "llm.call", label=label, model=model, stop=response.stop_reason, **call)
+        if response.stop_reason == "refusal":
+            details = getattr(response, "stop_details", None)
+            category = getattr(details, "category", None) if details else None
+            if self._refusal_model and model != self._refusal_model:
+                log_event(
+                    logger,
+                    "llm.refusal_fallback",
+                    logging.WARNING,
+                    label=label,
+                    category=category,
+                    declined=model,
+                    now_using=self._refusal_model,
+                )
+                return self.complete(
+                    label=f"{label}.fallback",
+                    model=self._refusal_model,
+                    system=system,
+                    prompt=prompt,
+                    effort=effort,
+                    max_tokens=max_tokens,
+                    json_schema=json_schema,
+                )
+            raise LLMRefusal(f"{label}: model declined the request (category={category})")
+        if response.stop_reason == "max_tokens":
+            log_event(logger, "llm.truncated", logging.WARNING, label=label, max_tokens=max_tokens)
+        text = "".join(
+            b.text for b in response.content if getattr(b, "type", None) == "text"
+        ).strip()
+        if not text:
+            raise LLMError(f"{label}: empty response")
+        return LLMResponse(text=text, stop_reason=response.stop_reason)
+
+    def check_model(self, model: str) -> str | None:
+        """None if `model` answers a token count (free), else the reason it doesn't (`--check`)."""
+        try:
+            self.client.messages.count_tokens(
+                model=model, messages=[{"role": "user", "content": "hi"}]
+            )
+        except anthropic.APIError as exc:
+            return str(exc)[:300]
+        return None
+
+
+def _error_message(response: httpx.Response) -> str:
+    try:
+        data = response.json()
+    except ValueError:
+        return response.text[:200]
+    if isinstance(data, list) and data:
+        data = data[0]
+    error = data.get("error", data) if isinstance(data, dict) else {}
+    message = error.get("message", "") if isinstance(error, dict) else str(error)
+    return str(message)[:500]
+
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
+
+
+def provider_settings(config: Config) -> tuple[str, str]:
+    """(base URL, API key env var) for the configured provider, with config overrides."""
+    if config.llm_provider not in PROVIDERS and not config.llm_base_url:
+        raise LLMError(
+            f"Unknown llm_provider {config.llm_provider!r}; use one of {', '.join(PROVIDERS)} "
+            "or set llm_base_url and llm_api_key_env."
+        )
+    base_url, key_env = PROVIDERS.get(config.llm_provider, ("", ""))
+    return config.llm_base_url or base_url, config.llm_api_key_env or key_env
+
+
+def create_llm(config: Config) -> LLM:
+    """Build the client for `config.llm_provider`, reading the API key from the environment."""
+    base_url, key_env = provider_settings(config)
+    if config.llm_provider == "bedrock":
+        api_key = os.environ.get(key_env, "")
+        if not api_key:
+            raise LLMError(
+                f"{key_env} is not set. Create an Amazon Bedrock API key and add it to .env "
+                "locally, or as a GitHub Actions secret."
+            )
+        client = anthropic.AnthropicBedrockMantle(
+            aws_region=config.aws_region, api_key=api_key, max_retries=4
+        )
+        return AnthropicLLM(client, config, server_fallbacks=False)
+    if config.llm_provider == "anthropic":
+        hint = f"Set {key_env} (in .env locally, or as a GitHub Actions secret)."
+        try:
+            client = anthropic.Anthropic(max_retries=4)
+        except anthropic.AnthropicError as exc:
+            raise LLMError(f"Could not load Claude API credentials ({exc}). {hint}") from exc
+        if not (client.api_key or client.auth_token or client.credentials):
+            raise LLMError(f"No Claude API credentials found. {hint}")
+        return AnthropicLLM(client, config)
+    api_key = os.environ.get(key_env, "")
+    if not api_key:
+        raise LLMError(
+            f"{key_env} is not set. Add your {config.llm_provider} API key to .env locally, "
+            "or as a GitHub Actions secret."
+        )
+    return OpenAICompatLLM(config, base_url, api_key)
